@@ -1,0 +1,253 @@
+RNGkind("L'Ecuyer-CMRG")
+set.seed(1)
+library(ggplot2)
+library(safestats)
+alpha <- 0.05
+
+evalue_2prop <- function(ya, yb, gamma = 0.18) {
+  m <- length(ya)
+  logE <- 0
+  E <- numeric(m)
+  Ua <- 0; Ub <- 0
+  for (j in 1:m) {
+    ta <- (Ua + gamma) / ((j - 1) + 2 * gamma)     # posterior-mean rate, group a (data thru j-1)
+    tb <- (Ub + gamma) / ((j - 1) + 2 * gamma)     # posterior-mean rate, group b
+    t0 <- 0.5 * (ta + tb)                          # pooled null rate (n_a = n_b = 1)
+    a <- ya[j]; b <- yb[j]
+    logE <- logE +
+      (a*log(ta) + (1-a)*log(1-ta) - a*log(t0) - (1-a)*log(1-t0)) +
+      (b*log(tb) + (1-b)*log(1-tb) - b*log(t0) - (1-b)*log(1-t0))
+    E[j] <- exp(logE)
+    Ua <- Ua + a; Ub <- Ub + b
+  }
+  E
+}
+
+firstcross_2prop <- function(ya, yb, gamma = 0.18, thr = 1/alpha) {
+  logE <- 0
+  Ua <- 0
+  Ub <- 0
+  N <- length(ya)
+  lb <- log(thr)
+  
+  for (j in 1:N) {
+    ta <- (Ua + gamma)/((j-1) + 2*gamma); tb <- (Ub + gamma)/((j-1) + 2*gamma)
+    t0 <- 0.5*(ta + tb); a <- ya[j]; b <- yb[j]
+    logE <- logE +
+      (a*log(ta)+(1-a)*log(1-ta) - a*log(t0)-(1-a)*log(1-t0)) +
+      (b*log(tb)+(1-b)*log(1-tb) - b*log(t0)-(1-b)*log(1-t0))
+    if (logE >= lb) return(c(reject = 1, stop = j))
+    Ua <- Ua + a; Ub <- Ub + b
+  }
+  c(reject = 0, stop = N)
+}
+
+## =====================================================================
+## Experiment 1: validity under optional stopping  (Fig. S3.1)
+## =====================================================================
+## e-value  vs.  Fisher's exact test applied repeatedly (peeking)
+exp1 <- function(theta0 = 0.5, N = 300, M = 1000, gamma = 0.18, look_every = 5) {
+  e_rej <- e_stop <- f_rej <- f_stop <- numeric(M)
+  for (s in 1:M) {
+    ya <- rbinom(N, 1, theta0); yb <- rbinom(N, 1, theta0)   # H0: equal rates
+    fc <- firstcross_2prop(ya, yb, gamma)
+    e_rej[s] <- fc[1]
+    e_stop[s] <- fc[2]
+    
+    looks <- seq(look_every, N, by = look_every)
+    sig <- 0
+    st <- N
+    for (n in looks) {                                       # peeking Fisher
+      sa <- sum(ya[1:n])
+      sb <- sum(yb[1:n])
+      if (fisher.test(matrix(c(sa, n-sa, sb, n-sb), 2, byrow = TRUE))$p.value <= alpha) {
+        sig <- 1; st <- n; break }
+    }
+    f_rej[s] <- sig
+    f_stop[s] <- st
+  }
+  list(typeI = c(evalue = mean(e_rej), fisher_peeking = mean(f_rej)),
+       e_rej = e_rej, e_stop = e_stop, f_rej = f_rej, f_stop = f_stop, N = N)
+}
+
+r1 <- exp1()                     # (Fisher every block is the slow part; ~1–2 min)
+print(r1$typeI)                  # expect evalue <= 0.05, fisher_peeking >> 0.05
+
+## cumulative type-I error vs. number of blocks monitored
+grid <- seq(look_every <- 5, r1$N, by = 5)
+cum  <- function(rej, stop) sapply(grid, function(t) mean(rej == 1 & stop <= t))
+df_cum <- rbind(
+  data.frame(t = grid, err = cum(r1$e_rej, r1$e_stop), method = "e-value"),
+  data.frame(t = grid, err = cum(r1$f_rej, r1$f_stop), method = "peeking Fisher"))
+p_cum <- ggplot(df_cum, aes(t, err, colour = method)) +
+  geom_line(linewidth = 1) + geom_hline(yintercept = alpha, linetype = "dashed") +
+  labs(x = "number of blocks monitored", y = "cumulative type-I error")
+
+print(p_cum)
+
+
+## =====================================================================
+## Experiment 2: smallest "planning" horizon m for 80% power at a FIXED theta_a, and the
+## expected sample size actually used at that horizon. (Analogue of paper's Fig. 3(a))
+## =====================================================================
+sample_size_curve <- function(theta_a, delta, gamma, N_max = 8000, M = 2000) {
+  theta_b <- theta_a + delta
+  res <- t(replicate(M, firstcross_2prop(rbinom(N_max, 1, theta_a),
+                                         rbinom(N_max, 1, theta_b), gamma)))
+  tau <- res[, "stop"]; power_at_Nmax <- mean(res[, "reject"])
+  if (power_at_Nmax < 0.8) return(c(m_planned = NA, m_expected = NA, power = power_at_Nmax))
+  m_planned  <- as.numeric(quantile(tau, 0.8, type = 1))   # horizon covering 80% of runs
+  m_expected <- mean(pmin(tau, m_planned))                 # avg. usage at that horizon
+  c(m_planned = m_planned, m_expected = m_expected, power = power_at_Nmax)
+}
+
+gammas   <- c(0.05, 0.18, 1, 20, 1000)     # 0.18 ~= mildly U-shaped; 1000 ~= peaked at 0.5
+theta_as <- c(0.01, 0.1, 0.5)
+deltas   <- seq(0.05, 0.3, by = 0.05)
+
+grid <- expand.grid(gamma = gammas, theta_a = theta_as, delta = deltas)
+grid <- subset(grid, theta_a + delta <= 1)
+
+res <- t(apply(grid, 1, function(r)
+  sample_size_curve(theta_a = r["theta_a"], delta = r["delta"], gamma = r["gamma"])))
+grid <- cbind(grid, res)
+
+## ---- worst-case (planning horizon) only ----
+p_planning <- ggplot(grid, aes(delta, log(m_planned), colour = factor(gamma))) +
+  geom_line() + geom_point(na.rm = TRUE) +
+  facet_wrap(~ theta_a, labeller = label_both) +
+  labs(x = expression(delta), y = "log(sample size, blocks)",
+       colour = expression(gamma), title = "Planning horizon (80% power)")
+
+## ---- expected usage only ----
+p_expected <- ggplot(grid, aes(delta, log(m_expected), colour = factor(gamma))) +
+  geom_line() + geom_point(na.rm = TRUE) +
+  facet_wrap(~ theta_a, labeller = label_both) +
+  labs(x = expression(delta), y = "log(sample size, blocks)",
+       colour = expression(gamma), title = "Expected usage")
+
+ggsave("turner_planning.pdf", p_planning, width = 9, height = 6)
+ggsave("turner_exp.pdf", p_expected, width = 9, height = 6)
+
+
+## =====================================================================
+## Experimant 3: worst-case + expected sample size, all 3 restrictions (Analogue of Fig.4)
+## =====================================================================
+
+firstcross_pkg <- function(ya, yb, design, thr = 1/alpha, look_every) {
+  N <- length(ya)
+  for (t in seq(look_every, N, by = look_every)) {
+    if (safe.prop.test(ya[1:t], yb[1:t], designObj = design)$eValue >= thr)
+      return(c(reject = 1, stop = t))
+  }
+  c(reject = 0, stop = N)
+}
+
+stream_stopper <- function(theta_a, theta_b, gamma, restriction, N_max, design = NULL) {
+  ya <- rbinom(N_max, 1, theta_a); yb <- rbinom(N_max, 1, theta_b)
+  if (restriction == "none") firstcross_2prop(ya, yb, gamma)
+  else                       firstcross_pkg(ya, yb, design, look_every = 10) #before: look_every = 40 to bring down computation time
+}
+
+sample_size_by_restriction_ci <- function(theta_a, delta, gamma, restriction,
+                                          N_max = 8000, M = 1000, alpha = 0.05, B = 1000) {
+  design_delta <- 0.04 
+  theta_b <- theta_a + delta
+  design <- NULL
+  hyper <- list(betaA1 = gamma, betaA2 = gamma, betaB1 = gamma, betaB2 = gamma)
+  if (restriction == "difference") {
+    design <- designSafeTwoProportions(na=1, nb=1, alpha=alpha, delta=design_delta, beta=0.2,
+                                       alternativeRestriction="difference", hyperParameterValues=hyper)
+  } else if (restriction == "logOddsRatio") {
+    theta_b_design <- theta_a + design_delta
+    lor <- log(theta_b_design/(1-theta_b_design) * (1-theta_a)/theta_a)
+    design <- designSafeTwoProportions(na=1, nb=1, alpha=alpha, delta=lor, beta=0.2,
+                                       alternativeRestriction="logOddsRatio", hyperParameterValues=hyper)
+  }
+  res <- t(replicate(M, stream_stopper(theta_a, theta_b, gamma, restriction, N_max, design)))
+  tau <- res[, "stop"]; power <- mean(res[, "reject"])
+  if (power < 0.8) return(c(worst=NA, worst_lo=NA, worst_hi=NA, exp=NA, exp_lo=NA, exp_hi=NA, power=power))
+  
+  m_planned <- as.numeric(quantile(tau, 0.8, type = 1))
+  ex_draws  <- pmin(tau, m_planned)
+  
+  ## bootstrap: resample the M draws with replacement, B times, recompute both statistics
+  boot <- replicate(B, {
+    s <- sample(tau, M, replace = TRUE)
+    q <- as.numeric(quantile(s, 0.8, type = 1))
+    e <- mean(pmin(s, q))
+    c(worst = q, exp = e)
+  })
+  
+  c(worst    = m_planned,
+    worst_lo = unname(quantile(boot["worst",],.025)), 
+    worst_hi = unname(quantile(boot["worst",],.975)),
+    exp      = mean(ex_draws),
+    exp_lo   = unname(quantile(boot["exp",],.025)),
+    exp_hi   = unname(quantile(boot["exp",],.975)),
+    power = power)
+}
+
+## ---- sweep: 3 restrictions x several deltas (fixed theta_a) ----
+theta_a      <- 0.5
+deltas       <- seq(0.05, 0.45, by = 0.05)
+restrictions <- c("none", "difference", "logOddsRatio")
+
+grid4 <- expand.grid(restriction = restrictions, delta = deltas, stringsAsFactors = FALSE)
+grid4 <- grid4[theta_a + grid4$delta <= 1, ]
+
+res4 <- parallel::mclapply(seq_len(nrow(grid4)), function(r)
+  sample_size_by_restriction_ci(theta_a, grid4$delta[r], gamma = 0.18,
+                                restriction = grid4$restriction[r]),
+  mc.cores = 8)
+res4 <- t(do.call(cbind, res4)) 
+grid4 <- cbind(grid4, res4)
+
+## Fisher benchmark: independent of the restriction, repeated in every panel
+#fisher_n <- sapply(deltas, function(d)
+#  ceiling(power.prop.test(p1 = theta_a, p2 = theta_a + d, power = 0.8, sig.level = alpha)$n))
+#fisher_df <- do.call(rbind, lapply(restrictions, function(r)
+#  data.frame(delta = deltas, n = fisher_n, restriction = r, setting = "P-value (Fisher's exact test)")))
+
+fisher_n_simulated <- function(theta_a, theta_b, target_power = 0.8, alpha = 0.05,
+                               M = 1000, n_start = NULL, step = NULL) {
+  if (is.null(n_start))
+    n_start <- ceiling(power.prop.test(p1=theta_a, p2=theta_b, power=target_power, sig.level=alpha)$n)
+  if (is.null(step)) step <- max(1, round(n_start * 0.1))   # climb in ~10% increments
+  
+  n <- n_start
+  repeat {
+    power_est <- mean(replicate(M, {
+      a <- rbinom(1, n, theta_a); b <- rbinom(1, n, theta_b)
+      fisher.test(matrix(c(a, n-a, b, n-b), 2))$p.value <= alpha
+    }))
+    if (power_est >= target_power) break
+    n <- n + step
+  }
+  c(n = n, power = power_est)
+}
+
+fisher_true <- sapply(deltas, function(d)
+  fisher_n_simulated(theta_a = 0.5, theta_b = 0.5 + d)["n"])
+
+fisher_df <- do.call(rbind, lapply(restrictions, function(r)
+  data.frame(delta = deltas, n = fisher_true, restriction = r, setting = "P-value (Fisher's exact test)")))
+
+## ---- relabel to match the paper's panel titles ----
+lbl <- c(none = "uninformed", difference = "difference", logOddsRatio = "odds")
+grid4$restriction     <- factor(lbl[grid4$restriction],     levels = lbl)
+fisher_df$restriction <- factor(lbl[fisher_df$restriction], levels = lbl)
+
+df_long4 <- rbind(
+  transform(grid4, n = worst, lo = worst_lo, hi = worst_hi, setting = "E-value (worst case)")[, c("delta","restriction","n","lo","hi","setting")],
+  transform(grid4, n = exp,   lo = exp_lo,   hi = exp_hi, setting = "E-value (expected)")[,   c("delta","restriction","n","lo","hi","setting")],
+  transform(fisher_df, lo = NA, hi = NA)[, c("delta","restriction","n","lo","hi","setting")]
+)
+
+p_fig4 <- ggplot(df_long4, aes(delta, log(n), colour = setting, shape = setting)) +
+  geom_line() + geom_point(na.rm = TRUE) +
+  geom_errorbar(aes(ymin = log(lo), ymax = log(hi)), width = 0.01) +
+  facet_wrap(~ restriction) +
+  labs(x = expression(paste(delta, " (absolute difference)")),
+       y = "log of sample size for 80% power", colour = "setting", shape = "setting")
+ggsave("p_fig4.pdf", p_fig4, width = 9, height = 6)
