@@ -1,0 +1,117 @@
+set.seed(1)
+library(ggplot2)
+library(safestats)
+
+## sanity check
+print(safeZTestStat(z = 2, phiS = 0.1, n1 = 100,
+                    alternative = "twoSided", sigma = 1))
+
+## settings
+sigma <- 1
+alpha <- 0.05
+N <- 300; M <- 1000
+delta_bet <- 0.2
+phiS  <- delta_bet   # under the GROW default phiS == meanDiffMin, so we skip designSafeZ
+M_sweep <- 300
+
+run_sim <- function(mu, M) {
+  rej <- matrix(FALSE, M, 4, dimnames = list(NULL, c("fixed","peek","safestats","hand"))) #Mx4 table: did each of the 4 methods reject?
+  stp <- matrix(N,     M, 3, dimnames = list(NULL, c("peek","safestats","hand"))) # Mx3 table: stop time (init = N)
+  # loop over experiments
+  for (m in 1:M) {                                                        
+    x <- rnorm(N, mu, sigma)
+    S <- cumsum(x)
+    n <- 1:N
+    z <- S / (sigma * sqrt(n)) #z-stat
+    p <- 2 * pnorm(-abs(z)) # p-value
+    
+    E_pkg  <- sapply(n, function(t) # safestats e-value at every look
+      safeZTestStat(z = z[t], phiS = phiS, n1 = t,
+                    alternative = "twoSided", sigma = sigma))
+    ## hand-rolled e-value (cross-check)
+    #E_hand <- exp((delta_bet * S - n * delta_bet^2 / 2) / sigma^2)
+    E_hand <- exp(-n * delta_bet^2 / 2 / sigma^2) * cosh(delta_bet * S / sigma^2)
+    
+    rej[m, "fixed"]     <- p[N] <= alpha
+    rej[m, "peek"]      <- any(p      <= alpha)
+    rej[m, "safestats"] <- any(E_pkg  >= 1/alpha)
+    rej[m, "hand"]      <- any(E_hand >= 1/alpha)
+    
+    hp <- which(p      <= alpha); if (length(hp)) stp[m,"peek"]      <- hp[1]
+    hk <- which(E_pkg  >= 1/alpha); if (length(hk)) stp[m,"safestats"] <- hk[1]
+    hh <- which(E_hand >= 1/alpha); if (length(hh)) stp[m,"hand"]      <- hh[1]
+  }
+  list(rej = rej, stp = stp)
+}
+
+summarise_sim <- function(sim, M) {
+  rate <- colMeans(sim$rej) # average of each column = rejection rate per method
+  data.frame(
+    method = c("fixed-n","peeking","betting (safestats)","betting (hand)"),
+    rejection_rate = as.numeric(rate),
+    mc_se = as.numeric(sqrt(rate * (1 - rate) / M)), # monte carlo standard error
+    avg_sample_size = c(N, as.numeric(colMeans(sim$stp)))
+  )
+}
+
+simH0 <- run_sim(0,M)
+simH1 <- run_sim(delta_bet, M)
+cat("Under H0 (Type I error):\n")
+print(summarise_sim(simH0, M), digits = 3)
+cat("\nUnder H1 (power + sample size):\n")
+print(summarise_sim(simH1, M), digits = 3)
+
+## run simulation at different effect sizes for power analysis
+mus <- seq(0, 0.2, by = 0.025) # effect sizes 0, 0,025,...
+sweep <- do.call(rbind, lapply(mus, function(effect) {
+  s <- summarise_sim(run_sim(effect, M_sweep), M_sweep)
+  s$mu <- effect; s}))
+sweep$method <- factor(sweep$method,
+                       levels = c("fixed-n","peeking","betting (safestats)","betting (hand)"))
+
+sweep_plot <- droplevels(subset(sweep, method != "betting (hand)"))
+
+method_cols <- c(
+  "fixed-n"             = "#0072B2",  # blue
+  "peeking"             = "#D55E00",  # vermillion - reads as "invalid/danger"
+  "betting (safestats)" = "#009E73",  # green - reads as "safe"
+  "betting (hand)"      = "#CC79A7"   # pink (kept in case it reappears)
+)
+
+p_power <- ggplot(sweep_plot, aes(mu, rejection_rate, colour = method)) +
+  geom_line(linewidth = 1) + geom_point() +
+  geom_hline(yintercept = alpha, linetype = "dashed") +
+  scale_colour_manual(values = method_cols) +
+  labs(x = expression(paste("true effect ", mu)),
+       y = "rejection rate (Type I at mu=0, power at mu>0)")
+
+sweep_ass <- droplevels(subset(sweep, !(method %in% c("peeking", "betting (hand)"))))
+
+p_ass <- ggplot(sweep_ass, aes(mu, avg_sample_size, colour = method)) +
+  geom_line(linewidth = 1) + geom_point() +
+  scale_colour_manual(values = method_cols) +
+  labs(x = expression(paste("true effect ", mu)), y = "average sample size")
+
+## cumulative type I error vs number of looks
+grid <- seq(10, N, by = 10)
+cum_rate <- function(rej, stp) sapply(grid, function(t) mean(rej & stp <= t))
+df_cum <- rbind(
+  data.frame(t = grid, err = cum_rate(simH0$rej[,"peek"],    simH0$stp[,"peek"]),    method = "peeking"),
+  data.frame(t = grid, err = cum_rate(simH0$rej[,"safestats"], simH0$stp[,"safestats"]), method = "betting (safestats)"),
+  data.frame(t = grid, err = cum_rate(simH0$rej[,"hand"], simH0$stp[,"hand"]), method = "betting (hand)"))
+
+df_cum_plot <- droplevels(subset(df_cum, method != "betting (hand)"))
+
+p_cum <- ggplot(df_cum_plot, aes(t, err, colour = method)) +
+  geom_line(linewidth = 1) +
+  geom_hline(yintercept = alpha, linetype = "dashed") +
+  scale_colour_manual(values = method_cols) +
+  labs(x = "number of observations monitored", y = "cumulative Type I error")
+
+p_power <- p_power + scale_colour_manual(values = method_cols)
+p_ass   <- p_ass   + scale_colour_manual(values = method_cols)
+p_cum   <- p_cum   + scale_colour_manual(values = method_cols)
+
+print(p_power)
+print(p_ass)
+print(p_cum)
