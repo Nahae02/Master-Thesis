@@ -1,0 +1,219 @@
+RNGkind("L'Ecuyer-CMRG")
+set.seed(1)
+library(ggplot2)
+library(safestats)
+alpha <- 0.05
+
+cat("Cores detected by R:", parallel::detectCores(), "\n")
+
+## realistic parameters
+theta_a  <- 0.10
+rel_lifts <- c(0.02, 0.03, 0.04, 0.05)
+deltas   <- theta_a * rel_lifts                
+delta0   <- 0.002                              # anticipated effect (2% relative lift)
+#N_max    <- 2200000
+#look_every <- 20000
+M <- 1000
+
+mc.cores <- 100
+
+## prior definition 
+priorA1 <- 0.036; priorA2 <- 0.324             # mean 0.10 for control
+priorB1 <- 0.18;  priorB2 <- 0.18              # uninformative for treatment
+
+## ============================================================
+## Analytical reference for the dropped 1% relative-lift case
+## ============================================================
+n_1pct_lift <- ceiling(power.prop.test(p1 = theta_a, p2 = theta_a * 1.01,
+                                       power = 0.8, sig.level = alpha)$n)
+cat("Classical n per group for a 1% relative lift:", n_1pct_lift, "\n")
+
+## ---- vectorized unrestricted e-value stopper ----
+firstcross_2prop <- function(ya, yb, betaA1, betaA2, betaB1, betaB2,
+                             thr = 1/alpha, look_every = 1) {
+  N <- length(ya)
+  Ua_lag <- c(0, cumsum(ya)[-N])
+  Ub_lag <- c(0, cumsum(yb)[-N])
+  j <- seq_len(N)
+  ta <- (Ua_lag + betaA1) / ((j - 1) + betaA1 + betaA2)
+  tb <- (Ub_lag + betaB1) / ((j - 1) + betaB1 + betaB2)
+  t0 <- 0.5 * (ta + tb)
+  inc <- (ya*log(ta) + (1-ya)*log(1-ta) - ya*log(t0) - (1-ya)*log(1-t0)) +
+    (yb*log(tb) + (1-yb)*log(1-tb) - yb*log(t0) - (1-yb)*log(1-t0))
+  logE <- cumsum(inc)
+  checkpoints <- seq(look_every, N, by = look_every)
+  lb <- log(thr)
+  hit <- checkpoints[which(logE[checkpoints] >= lb)[1]]
+  if (!is.na(hit)) c(reject = 1, stop = hit) else c(reject = 0, stop = N)
+}
+
+firstcross_pkg <- function(ya, yb, design, thr = 1/alpha, look_every) {
+  N <- length(ya)
+  for (t in seq(look_every, N, by = look_every)) {
+    if (safe.prop.test(ya[1:t], yb[1:t], designObj = design)$eValue >= thr)
+      return(c(reject = 1, stop = t))
+  }
+  c(reject = 0, stop = N)
+}
+
+## ---- stream_stopper takes look_every explicitly, no longer relies on the global ----
+stream_stopper <- function(theta_a, theta_b, restriction, N_max, design = NULL, look_every) {
+  ya <- rbinom(N_max, 1, theta_a); yb <- rbinom(N_max, 1, theta_b)
+  if (restriction == "none")
+    firstcross_2prop(ya, yb, priorA1, priorA2, priorB1, priorB2, look_every = look_every)
+  else
+    firstcross_pkg(ya, yb, design, look_every = look_every)
+}
+
+## ---- N_max and look_every scale to each delta's own classical requirement ----
+#margin_factor <- 2     
+n_checkpoints <- 110   # matches the original 2,200,000 / 20,000 resolution
+
+sample_size_by_restriction <- function(theta_a, delta, restriction, alpha = 0.05) {
+  theta_b <- theta_a + delta
+  
+  n_np_d       <- ceiling(power.prop.test(p1 = theta_a, p2 = theta_b,
+                                          power = 0.8, sig.level = alpha)$n)
+  margin_d <- if (restriction == "none") 5 else 2
+  N_max_d      <- ceiling(margin_d * n_np_d)
+  look_every_d <- max(1, ceiling(N_max_d / n_checkpoints))
+  
+  design <- NULL
+  hyper <- list(betaA1 = priorA1, betaA2 = priorA2, betaB1 = priorB1, betaB2 = priorB2)
+  if (restriction == "difference") {
+    design <- designSafeTwoProportions(na=1, nb=1, alpha=alpha, delta=delta0, beta=0.2,
+                                       alternativeRestriction="difference", hyperParameterValues=hyper)
+  } else if (restriction == "logOddsRatio") {
+    theta_b_design <- theta_a + delta0
+    lor <- log(theta_b_design/(1-theta_b_design) * (1-theta_a)/theta_a)
+    design <- designSafeTwoProportions(na=1, nb=1, alpha=alpha, delta=lor, beta=0.2,
+                                       alternativeRestriction="logOddsRatio", hyperParameterValues=hyper)
+  }
+  res <- t(do.call(cbind, parallel::mclapply(1:M, function(i)
+    stream_stopper(theta_a, theta_b, restriction, N_max_d, design, look_every_d),
+    mc.cores = mc.cores, mc.preschedule = FALSE)))
+  tau <- res[, "stop"]; power <- mean(res[, "reject"])
+  if (power < 0.8) return(c(worst = NA, exp = NA, power = power))
+  m_planned  <- as.numeric(quantile(tau, 0.8, type = 1))
+  m_expected <- mean(pmin(tau, m_planned))
+  c(worst = m_planned, exp = m_expected, power = power)
+}
+
+## ---- sweep: 3 restrictions x 5 realistic deltas ----
+restrictions <- c("none", "difference", "logOddsRatio")
+grid4 <- expand.grid(restriction = restrictions, delta = deltas, stringsAsFactors = FALSE)
+
+res4 <- lapply(seq_len(nrow(grid4)), function(r)
+  sample_size_by_restriction(theta_a, grid4$delta[r], restriction = grid4$restriction[r]))
+res4 <- t(do.call(cbind, res4))
+grid4 <- cbind(grid4, res4)
+
+saveRDS(list(grid4 = grid4, res4 = res4), "checkpoint_grid4.rds")
+
+fisher_oracle <- sapply(deltas, function(d)
+  ceiling(power.prop.test(p1 = theta_a, p2 = theta_a + d, power = 0.8, sig.level = alpha)$n))
+
+## planned once at delta0
+n_fisher_misspec <- ceiling(power.prop.test(p1 = theta_a, p2 = theta_a + delta0,
+                                            power = 0.8, sig.level = alpha)$n)
+
+deltas_misspec_extended <- c(0.0005, 0.001, 0.0015, deltas)  # below and at/above delta0
+
+fisher_misspec_power <- sapply(deltas_misspec_extended, function(d)
+  mean(replicate(M, {
+    a <- rbinom(1, n_fisher_misspec, theta_a); b <- rbinom(1, n_fisher_misspec, theta_a + d)
+    fisher.test(matrix(c(a, n_fisher_misspec-a, b, n_fisher_misspec-b), 2))$p.value <= alpha
+  })))
+
+fisher_oracle_df <- do.call(rbind, lapply(restrictions, function(r)
+  data.frame(delta = deltas, n = fisher_oracle, restriction = r, setting = "P-value (Fisher, oracle delta)")))
+
+## ---- relabel + assemble the sample-size plot (oracle Fisher + e-value) ----
+lbl <- c(none = "uninformed", difference = "difference", logOddsRatio = "odds")
+grid4$restriction         <- factor(lbl[grid4$restriction],         levels = lbl)
+fisher_oracle_df$restriction <- factor(lbl[fisher_oracle_df$restriction], levels = lbl)
+
+fisher_misspec_n_df <- do.call(rbind, lapply(restrictions, function(r)
+  data.frame(delta = deltas, n = n_fisher_misspec, restriction = r, setting = "P-value (Fisher, misspecified at delta0)")))
+fisher_misspec_n_df$restriction <- factor(lbl[fisher_misspec_n_df$restriction], levels = lbl)
+
+df_long4 <- rbind(
+  transform(grid4, n = worst, setting = "E-value (worst case)")[, c("delta","restriction","n","setting")],
+  transform(grid4, n = exp,   setting = "E-value (expected)")[,   c("delta","restriction","n","setting")],
+  fisher_oracle_df[, c("delta","restriction","n","setting")],
+  fisher_misspec_n_df[, c("delta","restriction","n","setting")]
+)
+
+p_fig4 <- ggplot(df_long4, aes(delta, log(n), colour = setting, shape = setting)) +
+  geom_line() + geom_point(na.rm = TRUE) +
+  facet_wrap(~ restriction) +
+  labs(x = expression(paste(delta, " (absolute difference, ", theta[a], "=0.10)")),
+       y = "log of sample size for 80% power", colour = "setting", shape = "setting")
+ggsave("p_fig4_realistic.pdf", p_fig4, width = 9, height = 6)
+
+## ---- achieved power of the misspecified, fixed-n Fisher test ----
+p_misspec <- ggplot(data.frame(delta = deltas_misspec_extended, power = fisher_misspec_power),
+                    aes(delta, power)) +
+  geom_line() + geom_point() +
+  geom_hline(yintercept = 0.8, linetype = "dashed") +
+  geom_vline(xintercept = delta0, linetype = "dotted", colour = "grey40") +
+  labs(x = expression(paste(delta, " (true effect)")),
+       y = "achieved power",
+       title = paste0("Fisher planned once at \u03b4\u2080=", delta0,
+                      " (n=", n_fisher_misspec, "), evaluated at the true \u03b4"))
+ggsave("p_fisher_misspecified.pdf", p_misspec, width = 6, height = 4)
+
+# N_budget          <- n_fisher_misspec
+# M_budget          <- 100      # reduce for benchmarking, see below
+# look_every_budget <- 5000
+# 
+# seq_power_at_budget <- function(restriction, delta) {
+#   theta_b <- theta_a + delta
+#   design <- NULL
+#   hyper <- list(betaA1 = priorA1, betaA2 = priorA2, betaB1 = priorB1, betaB2 = priorB2)
+#   if (restriction == "difference") {
+#     design <- designSafeTwoProportions(na=1, nb=1, alpha=alpha, delta=delta0, beta=0.2,
+#                                        alternativeRestriction="difference", hyperParameterValues=hyper)
+#   } else if (restriction == "logOddsRatio") {
+#     theta_b_design <- theta_a + delta0
+#     lor <- log(theta_b_design/(1-theta_b_design) * (1-theta_a)/theta_a)
+#     design <- designSafeTwoProportions(na=1, nb=1, alpha=alpha, delta=lor, beta=0.2,
+#                                        alternativeRestriction="logOddsRatio", hyperParameterValues=hyper)
+#   }
+#   res <- do.call(rbind, parallel::mclapply(1:M_budget, function(i) {
+#     ya <- rbinom(N_budget, 1, theta_a); yb <- rbinom(N_budget, 1, theta_b)
+#     if (restriction == "none") {
+#       firstcross_2prop(ya, yb, priorA1, priorA2, priorB1, priorB2, look_every = look_every_budget)
+#     } else {
+#       firstcross_pkg(ya, yb, design, look_every = look_every_budget)
+#     }
+#   }, mc.cores = mc.cores, mc.preschedule = FALSE))
+#   mean(res[, "reject"])
+# }
+# 
+# grid_budget <- expand.grid(restriction = restrictions, delta = deltas_misspec_extended, stringsAsFactors = FALSE)
+# grid_budget$power <- mapply(seq_power_at_budget, grid_budget$restriction, grid_budget$delta)
+# 
+# fisher_misspec_power <- sapply(deltas_misspec_extended, function(d)
+#   mean(replicate(1000, {
+#     a <- rbinom(1, N_budget, theta_a); b <- rbinom(1, N_budget, theta_a + d)
+#     fisher.test(matrix(c(a, N_budget-a, b, N_budget-b), 2))$p.value <= alpha
+#   })))
+# 
+# lbl2 <- c(none = "uninformed", difference = "difference", logOddsRatio = "odds")
+# df_budget_compare <- rbind(
+#   data.frame(delta = deltas_misspec_extended, power = fisher_misspec_power,
+#              method = "Fisher (fixed n, misspecified)"),
+#   transform(grid_budget, method = paste0("E-value (", lbl2[restriction], "), same budget"))[, c("delta","power","method")]
+# )
+# 
+# saveRDS(df_budget_compare, "df_budget_compare.rds")   # checkpoint before plotting
+# 
+# p_budget_compare <- ggplot(df_budget_compare, aes(delta, power, colour = method)) +
+#   geom_line() + geom_point() +
+#   geom_hline(yintercept = 0.8, linetype = "dashed") +
+#   geom_vline(xintercept = delta0, linetype = "dotted", colour = "grey40") +
+#   labs(x = expression(paste(delta, " (true effect)")), y = "achieved power",
+#        title = paste0("Same fixed budget n=", N_budget, ": Fisher vs. e-value tests"),
+#        colour = NULL)
+# ggsave("p_same_budget_comparison.pdf", p_budget_compare, width = 8, height = 5)
