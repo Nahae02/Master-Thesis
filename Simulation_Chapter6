@@ -1,0 +1,267 @@
+RNGkind("L'Ecuyer-CMRG")
+set.seed(1)
+library(parallel)
+library(ggplot2)
+library(safestats)
+library(dplyr)
+library(tidyr)
+
+alpha <- 0.05
+
+theta_a_ref <- 0.1
+gamma_ref   <- 0.18
+hyper_ref   <- list(betaA1 = 0.036, betaA2 = 0.324,
+                    betaB1 = gamma_ref, betaB2 = gamma_ref)
+N_max     <- 715000
+n_points  <- 20
+M <- 20
+
+log_seq <- function(from, to, length.out) {
+  unique(round(exp(seq(log(from), log(to), length.out = length.out))))
+}
+
+design_cs <- designSafeTwoProportions(na = 1, nb = 1, alpha = alpha, nBlocksPlan = N_max, pilot = TRUE, hyperParameterValues = hyper_ref)
+## design built WITHOUT delta/alternativeRestriction (defaults to "none"):
+## the CS functions sweep delta internally via deltaStart/deltaStop/precision,
+## so the design itself should stay unrestricted. Worth a quick sanity check
+## once you can run this against the real package.
+
+calculateEValuesForLinearDeltaGridFast <- function(ya, yb, na, nb, hyper_ref,
+                                                    precision = 10, alpha = 0.05,
+                                                    runningIntersection = TRUE) {
+  deltaVec <- seq(-0.99, 0.99, length.out = precision)
+  cumYa <- cumsum(ya)
+  cumYb <- cumsum(yb)
+  priorA1 <- hyper_ref[["betaA1"]]; priorA2 <- hyper_ref[["betaA2"]]
+  priorB1 <- hyper_ref[["betaB1"]]; priorB2 <- hyper_ref[["betaB2"]]
+  ciEValues <- data.frame()
+  for (delta in deltaVec) {
+    currentE <- 1
+    breveThetaA <- priorA1 / (priorA1 + priorA2)
+    breveThetaB <- priorB1 / (priorB1 + priorB2)
+    thetaARIPr <- safestats:::tryOrFailWithNA(stats::uniroot(
+      safestats:::calculateDerivativeKLTwoProportionsLinear,
+      interval = c(max(c(0, -delta)) + 0.001, min(c(1, 1 - delta)) - 0.001),
+      delta = delta, na = na, nb = nb, breveThetaA = breveThetaA, breveThetaB = breveThetaB)$root)
+    
+    for (i in seq_along(ya)) {
+      if (!is.na(thetaARIPr)) {
+        likelihoodAlternative <- safestats:::likelihoodTwoProportions(
+          na1 = ya[i], na = na, nb1 = yb[i], nb = nb, thetaA = breveThetaA, thetaB = breveThetaB)
+        likelihoodRIPr <- safestats:::likelihoodTwoProportions(
+          na1 = ya[i], na = na, nb1 = yb[i], nb = nb, thetaA = thetaARIPr, thetaB = thetaARIPr + delta)
+        currentE <- currentE * likelihoodAlternative / likelihoodRIPr
+      }
+      if ((currentE >= 1 / alpha) & runningIntersection) {
+        break
+      }
+      ## inlined posterior-mean formula, no function call, O(1) via cumsum lookup
+      breveThetaA <- (cumYa[i] + priorA1) / (i * na + priorA1 + priorA2)
+      breveThetaB <- (cumYb[i] + priorB1) / (i * nb + priorB1 + priorB2)
+      thetaARIPr <- safestats:::tryOrFailWithNA(stats::uniroot(
+        safestats:::calculateDerivativeKLTwoProportionsLinear,
+        interval = c(max(c(0, -delta)) + 0.001, min(c(1, 1 - delta)) - 0.001),
+        delta = delta, na = na, nb = nb, breveThetaA = breveThetaA, breveThetaB = breveThetaB)$root)
+    }
+    ciEValues <- rbind(ciEValues, data.frame(delta = delta, E = currentE))
+  }
+  return(ciEValues)
+}
+
+computeConfidenceBoundsForDifferenceTwoProportionsFast <- function(ya, yb, precision, safeDesign) {
+  na <- safeDesign[["nPlan"]][["na"]]
+  nb <- safeDesign[["nPlan"]][["nb"]]
+  alpha <- safeDesign[["alpha"]]
+  eValuesDeltaGrid <- calculateEValuesForLinearDeltaGridFast(
+    ya = ya, yb = yb, na = na, nb = nb,
+    hyper_ref = safeDesign[["betaPriorParameterValues"]],
+    precision = precision, alpha = alpha, runningIntersection = TRUE)
+  ciSummary <- eValuesDeltaGrid %>% dplyr::filter(.data[["E"]] < 
+    1 / alpha) %>% dplyr::summarise(lowerBound = min(.data[["delta"]]), 
+    upperBound = max(.data[["delta"]]))
+  return(as.list(ciSummary))
+}
+
+## =====================================================================
+## Experiment 4a: single-stream trace plot
+## =====================================================================
+theta_a <- 0.1
+theta_b <- theta_a + 0.002
+
+ya <- rbinom(N_max, 1, theta_a)
+yb <- rbinom(N_max, 1, theta_b)
+
+checkpoints <- log_seq(10, N_max, n_points)
+bounds_raw  <- parallel::mclapply(checkpoints, function(m)
+  computeConfidenceBoundsForDifferenceTwoProportionsFast(ya[1:m], yb[1:m], precision = 4000, safeDesign = design_cs),
+  mc.cores = 100)
+
+df_trace <- data.frame(
+  m     = checkpoints,
+  lower = sapply(bounds_raw, function(b) b$lowerBound),
+  upper = sapply(bounds_raw, function(b) b$upperBound)
+)
+saveRDS(df_trace, "df_trace.rds")
+
+p_trace <- ggplot(df_trace, aes(m)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), fill = "grey70", alpha = 0.5) +
+  geom_line(aes(y = lower)) +
+  geom_line(aes(y = upper)) +
+  geom_hline(yintercept = theta_b - theta_a, linetype = "dashed", colour = "red") +
+  scale_x_log10() +
+  labs(x = "number of blocks (log scale)", y = expression(delta),
+       title = "Confidence sequence for one simulated stream")
+ggsave("cs_trace.pdf", p_trace, width = 6, height = 4)
+
+p_trace_zoom <- p_trace + coord_cartesian(ylim = c(-0.02, 0.02))
+ggsave("cs_trace_zoom.pdf", p_trace_zoom, width = 6, height = 4)
+
+## =====================================================================
+## Experiment 4b: width comparison plot
+## =====================================================================
+na <- 1; nb <- 1
+z_alpha <- qnorm(1 - alpha/2)
+tol <- 1e-6
+outDir <- "width_ratio_results"
+dir.create(outDir, showWarnings = FALSE)
+
+logExcessAtN <- function(delta, ya, yb, na, nb, cumYa, cumYb,
+                         priorA1, priorA2, priorB1, priorB2, n, alpha) {
+  currentE <- 1
+  breveThetaA <- priorA1 / (priorA1 + priorA2)
+  breveThetaB <- priorB1 / (priorB1 + priorB2)
+  thetaARIPr <- safestats:::tryOrFailWithNA(stats::uniroot(safestats:::calculateDerivativeKLTwoProportionsLinear, interval = c(max(c(0, -delta)) + 0.001, min(c(1, 1 - delta)) - 0.001),
+    delta = delta, na = na, nb = nb, breveThetaA = breveThetaA, breveThetaB = breveThetaB)$root)
+  
+  for (i in seq_len(n)) {
+    if (!is.na(thetaARIPr)) {
+      likAlt <- safestats:::likelihoodTwoProportions(na1 = ya[i], na = na, nb1 = yb[i], nb = nb, thetaA = breveThetaA, thetaB = breveThetaB)
+      likRIPr <- safestats:::likelihoodTwoProportions(na1 = ya[i], na = na, nb1 = yb[i], nb = nb, thetaA = thetaARIPr, thetaB = thetaARIPr + delta)
+      currentE <- currentE * likAlt / likRIPr
+    }
+    if (currentE >= 1 / alpha) return(log(currentE) - log(1 / alpha))
+    
+    breveThetaA <- (cumYa[i] + priorA1) / (i * na + priorA1 + priorA2)
+    breveThetaB <- (cumYb[i] + priorB1) / (i * nb + priorB1 + priorB2)
+    thetaARIPr <- safestats:::tryOrFailWithNA(stats::uniroot(safestats:::calculateDerivativeKLTwoProportionsLinear, interval = c(max(c(0, -delta)) + 0.001, min(c(1, 1 - delta)) - 0.001),
+      delta = delta, na = na, nb = nb, breveThetaA = breveThetaA, breveThetaB = breveThetaB)$root)
+  }
+  log(currentE) - log(1 / alpha)
+}
+
+findCSBoundary <- function(side, lo, hi, ya, yb, na, nb, cumYa, cumYb, priorA1, priorA2, priorB1, priorB2, n, alpha, tol = 1e-6) {
+  f <- function(delta) logExcessAtN(delta, ya, yb, na, nb, cumYa, cumYb, priorA1, priorA2, priorB1, priorB2, n, alpha)
+  fLo <- f(lo)
+  fHi <- f(hi)
+  if (is.na(fLo) || is.na(fHi) || sign(fLo) == sign(fHi)) {
+    return(if (side == "lower") lo else hi)
+  }
+  stats::uniroot(f, lower = lo, upper = hi, tol = tol)$root
+}
+
+computeCSWidthRootfind <- function(ya, yb, na, nb, hyper_ref,
+                                   checkpoints, alpha = 0.05, tol = 1e-6) {
+  checkpoints <- sort(checkpoints)
+  cumYa <- cumsum(ya); cumYb <- cumsum(yb)
+  priorA1 <- hyper_ref[["betaA1"]]; priorA2 <- hyper_ref[["betaA2"]]
+  priorB1 <- hyper_Ref[["betaB1"]]; priorB2 <- hyper_ref[["betaB2"]]
+  
+  lowerBound <- numeric(length(checkpoints)); upperBound <- numeric(length(checkpoints))
+  prevLo <- -0.99; prevHi <- 0.99
+  
+  for (k in seq_along(checkpoints)) {
+    n <- checkpoints[k]
+    thetaAHat <- cumYa[n] / (n * na); thetaBHat <- cumYb[n] / (n * nb)
+    deltaHat <- max(min(thetaBHat - thetaAHat, 0.98), -0.98)
+    
+    lo <- findCSBoundary("lower", prevLo, deltaHat, ya, yb, na, nb, cumYa, cumYb, priorA1, priorA2, priorB1, priorB2, n, alpha, tol)
+    hi <- findCSBoundary("upper", deltaHat, prevHi, ya, yb, na, nb, cumYa, cumYb, priorA1, priorA2, priorB1, priorB2, n, alpha, tol)
+    lowerBound[k] <- lo
+    upperBound[k] <- hi
+    prevLo <- lo
+    prevHi <- hi
+  }
+  data.frame(n = checkpoints, lower = lowerBound, upper = upperBound, width = upperBound - lowerBound)
+}
+
+classicalCIWidthAtCheckpoints <- function(ya, yb, na, nb, checkpoints, alpha = 0.05) {
+  cumYa <- cumsum(ya); cumYb <- cumsum(yb)
+  z <- qnorm(1 - alpha / 2)
+  sapply(checkpoints, function(n) {
+    nAtot <- n * na; nBtot <- n * nb
+    thetaAHat <- cumYa[n] / nAtot; thetaBHat <- cumYb[n] / nBtot
+    se <- sqrt(thetaAHat * (1 - thetaAHat) / nAtot + thetaBHat * (1 - thetaBHat) / nBtot)
+    2 * z * se
+  })
+}
+
+## ---- One replicate: simulate, compute both widths, checkpoint to disk ----
+
+runOneReplicate <- function(m) {
+  repFile <- file.path(outDir, sprintf("rep_%02d.rds", m))
+  if (file.exists(repFile)) {
+    cat("Replicate", m, "already done, loading from disk\n")
+    return(readRDS(repFile))
+  }
+  
+  set.seed(1000 + m)  # distinct, reproducible seed per replicate
+  nMax <- max(checkpoints)
+  ya <- rbinom(nMax, na, theta_a)
+  yb <- rbinom(nMax, nb, theta_b)
+  
+  t0 <- Sys.time()
+  csRes <- computeCSWidthRootfind(ya, yb, na, nb, hyper_ref, checkpoints, alpha, tol)
+  ciWidths <- classicalCIWidthAtCheckpoints(ya, yb, na, nb, checkpoints, alpha)
+  elapsed <- as.numeric(Sys.time() - t0, units = "secs")
+  cat("Replicate", m, "done in", round(elapsed, 1), "s\n")
+  
+  result <- rbind(
+    data.frame(rep = m, n = checkpoints, width = csRes$width, method = "AV confidence sequence"),
+    data.frame(rep = m, n = checkpoints, width = ciWidths, method = "Classical CI (prop.test)")
+  )
+  saveRDS(result, repFile)
+  result
+}
+
+## ---- Run all M replicates in parallel, combine, save ----
+
+allResults <- parallel::mclapply(seq_len(M), runOneReplicate, mc.cores = nCores)
+dfRaw <- do.call(rbind, allResults)
+saveRDS(dfRaw, file.path(outDir, sprintf("width_ratio_raw_M%d.rds", M)))
+
+dfAvg <- aggregate(width ~ n + method, data = dfRaw, FUN = mean)
+dfAvg <- dfAvg[order(dfAvg$method, dfAvg$n), ]
+saveRDS(dfAvg, file.path(outDir, sprintf("df_width_long_M%d.rds", M)))
+
+cat("\nDone. Averaged result saved to", file.path(outDir, sprintf("df_width_long_M%d.rds", M)), "\n")
+cat("Raw per-replicate data saved to", file.path(outDir, sprintf("width_ratio_raw_M%d.rds", M)), "\n")
+
+
+df_ratio <- dfAvg %>%
+  pivot_wider(names_from = method, values_from = width) %>%
+  rename(cs_width = `AV confidence sequence`, ci_width = `Classical CI (prop.test)`) %>%
+  mutate(ratio = cs_width / ci_width, theoretical = sqrt(2 * log(1 / alpha) + log(n)) / z_alpha)
+
+ggplot(df_ratio, aes(x = n)) +
+  geom_point(aes(y = ratio, color = "Empirical (M=20 avg)")) +
+  geom_line(aes(y = ratio, color = "Empirical (M=20 avg)")) +
+  geom_line(aes(y = theoretical, color = "Theoretical"), linetype = "dashed") +
+  scale_x_log10(labels = scales::comma) +
+  labs(x = "Sample size n (log scale)",
+       y = "Width ratio (CS / classical CI)",
+       color = NULL,
+       title = "Empirical vs. theoretical asymptotic width ratio (M=20 replicates)") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+ggsave("width_ratio_validation.pdf", width = 6, height = 4)
+
+ggplot(dfAvg, aes(x = n, y = width, color = method)) +
+  geom_line() + geom_point() +
+  scale_x_log10() +
+  labs(x = "n (per group, log scale)", y = "mean CI width", color = NULL) +
+  theme_minimal() +
+  theme(legend.position = "inside", legend.position.inside = c(0.75, 0.75),
+        legend.background = element_blank())
+
+ggsave("figure_6_4_updated.pdf", width = 6, height = 4)
