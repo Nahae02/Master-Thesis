@@ -3,8 +3,10 @@ set.seed(1)
 library(ggplot2)
 library(safestats)
 alpha <- 0.05
+gamma <- 0.18
 
-evalue_2prop <- function(ya, yb, gamma = 0.18) {
+## --- not used ---
+evalue_2prop <- function(ya, yb, gamma) {
   m <- length(ya)
   logE <- 0
   E <- numeric(m)
@@ -23,7 +25,7 @@ evalue_2prop <- function(ya, yb, gamma = 0.18) {
   E
 }
 
-firstcross_2prop <- function(ya, yb, gamma = 0.18, thr = 1/alpha) {
+firstcross_2prop <- function(ya, yb, gamma, thr = 1/alpha) {
   logE <- 0
   Ua <- 0
   Ub <- 0
@@ -46,7 +48,7 @@ firstcross_2prop <- function(ya, yb, gamma = 0.18, thr = 1/alpha) {
 ## Experiment 1: validity under optional stopping  (Fig. S3.1)
 ## =====================================================================
 ## e-value  vs.  Fisher's exact test applied repeatedly (peeking)
-exp1 <- function(theta0 = 0.5, N = 300, M = 1000, gamma = 0.18, look_every = 5) {
+exp1 <- function(theta0 = 0.5, N = 300, M = 1000, gamma, look_every = 5) {
   e_rej <- e_stop <- f_rej <- f_stop <- numeric(M)
   for (s in 1:M) {
     ya <- rbinom(N, 1, theta0); yb <- rbinom(N, 1, theta0)   # H0: equal rates
@@ -103,24 +105,24 @@ sample_size_curve <- function(theta_a, delta, gamma, N_max = 8000, M = 2000) {
 
 gammas   <- c(0.05, 0.18, 1, 20, 1000)     # 0.18 ~= mildly U-shaped; 1000 ~= peaked at 0.5
 theta_as <- c(0.01, 0.1, 0.5)
-deltas   <- seq(0.05, 0.3, by = 0.05)
+deltas_exp2   <- seq(0.05, 0.3, by = 0.05)
 
-grid <- expand.grid(gamma = gammas, theta_a = theta_as, delta = deltas)
-grid <- subset(grid, theta_a + delta <= 1)
+grid2 <- expand.grid(gamma = gammas, theta_a = theta_as, delta = deltas_exp2)
+grid2 <- subset(grid2, theta_a + delta <= 1)
 
-res <- t(apply(grid, 1, function(r)
+res <- t(apply(grid2, 1, function(r)
   sample_size_curve(theta_a = r["theta_a"], delta = r["delta"], gamma = r["gamma"])))
-grid <- cbind(grid, res)
+grid2 <- cbind(grid2, res)
 
 ## ---- worst-case (planning horizon) only ----
-p_planning <- ggplot(grid, aes(delta, log(m_planned), colour = factor(gamma))) +
+p_planning <- ggplot(grid2, aes(delta, log(m_planned), colour = factor(gamma))) +
   geom_line() + geom_point(na.rm = TRUE) +
   facet_wrap(~ theta_a, labeller = label_both) +
   labs(x = expression(delta), y = "log(sample size, blocks)",
        colour = expression(gamma), title = "Planning horizon (80% power)")
 
 ## ---- expected usage only ----
-p_expected <- ggplot(grid, aes(delta, log(m_expected), colour = factor(gamma))) +
+p_expected <- ggplot(grid2, aes(delta, log(m_expected), colour = factor(gamma))) +
   geom_line() + geom_point(na.rm = TRUE) +
   facet_wrap(~ theta_a, labeller = label_both) +
   labs(x = expression(delta), y = "log(sample size, blocks)",
@@ -190,24 +192,24 @@ sample_size_by_restriction_ci <- function(theta_a, delta, gamma, restriction,
 
 ## ---- sweep: 3 restrictions x several deltas (fixed theta_a) ----
 theta_a      <- 0.5
-deltas       <- seq(0.05, 0.45, by = 0.05)
+deltas_exp3       <- seq(0.05, 0.45, by = 0.05)
 restrictions <- c("none", "difference", "logOddsRatio")
 
-grid4 <- expand.grid(restriction = restrictions, delta = deltas, stringsAsFactors = FALSE)
+grid4 <- expand.grid(restriction = restrictions, delta = deltas_exp3, stringsAsFactors = FALSE)
 grid4 <- grid4[theta_a + grid4$delta <= 1, ]
 
 res4 <- parallel::mclapply(seq_len(nrow(grid4)), function(r)
-  sample_size_by_restriction_ci(theta_a, grid4$delta[r], gamma = 0.18,
+  sample_size_by_restriction_ci(theta_a, grid4$delta[r], gamma,
                                 restriction = grid4$restriction[r]),
   mc.cores = 8)
 res4 <- t(do.call(cbind, res4)) 
 grid4 <- cbind(grid4, res4)
 
 ## Fisher benchmark: independent of the restriction, repeated in every panel
-#fisher_n <- sapply(deltas, function(d)
+#fisher_n <- sapply(deltas_exp3, function(d)
 #  ceiling(power.prop.test(p1 = theta_a, p2 = theta_a + d, power = 0.8, sig.level = alpha)$n))
 #fisher_df <- do.call(rbind, lapply(restrictions, function(r)
-#  data.frame(delta = deltas, n = fisher_n, restriction = r, setting = "P-value (Fisher's exact test)")))
+#  data.frame(delta = deltas_exp3, n = fisher_n, restriction = r, setting = "P-value (Fisher's exact test)")))
 
 fisher_n_simulated <- function(theta_a, theta_b, target_power = 0.8, alpha = 0.05,
                                M = 1000, n_start = NULL, step = NULL) {
@@ -227,11 +229,11 @@ fisher_n_simulated <- function(theta_a, theta_b, target_power = 0.8, alpha = 0.0
   c(n = n, power = power_est)
 }
 
-fisher_true <- sapply(deltas, function(d)
-  fisher_n_simulated(theta_a = 0.5, theta_b = 0.5 + d)["n"])
+fisher_true <- sapply(deltas_exp3, function(d)
+  fisher_n_simulated(theta_a, theta_b = theta_a + d)["n"])
 
 fisher_df <- do.call(rbind, lapply(restrictions, function(r)
-  data.frame(delta = deltas, n = fisher_true, restriction = r, setting = "P-value (Fisher's exact test)")))
+  data.frame(delta = deltas_exp3, n = fisher_true, restriction = r, setting = "P-value (Fisher's exact test)")))
 
 ## ---- relabel to match the paper's panel titles ----
 lbl <- c(none = "uninformed", difference = "difference", logOddsRatio = "odds")
