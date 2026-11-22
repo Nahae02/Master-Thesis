@@ -5,26 +5,35 @@ library(ggplot2)
 library(safestats)
 library(dplyr)
 library(tidyr)
+library(scales)
 
 alpha <- 0.05
 
 theta_a_ref <- 0.1
+delta0 <- 0.002
+theta_b <- theta_a_ref + delta0
 gamma_ref   <- 0.18
 hyper_ref   <- list(betaA1 = 0.036, betaA2 = 0.324,
                     betaB1 = gamma_ref, betaB2 = gamma_ref)
 N_max     <- 715000
 n_points  <- 20
-M <- 20
+
+z_alpha <- qnorm(1 - alpha / 2)
+
+wTarget <- 0.001
+
+thetaAStarGrid <- seq(0.05, 0.15, by = 0.01)
+M <- 500
 
 log_seq <- function(from, to, length.out) {
   unique(round(exp(seq(log(from), log(to), length.out = length.out))))
 }
 
 design_cs <- designSafeTwoProportions(na = 1, nb = 1, alpha = alpha, nBlocksPlan = N_max, pilot = TRUE, hyperParameterValues = hyper_ref)
-## design built WITHOUT delta/alternativeRestriction (defaults to "none"):
-## the CS functions sweep delta internally via deltaStart/deltaStop/precision,
-## so the design itself should stay unrestricted. Worth a quick sanity check
-## once you can run this against the real package.
+
+######################################################################
+### SAFESTATS FUNCTIONS REDONE USING BISECTION AND CUMULAITVE SUMS ###
+######################################################################
 
 calculateEValuesForLinearDeltaGridFast <- function(ya, yb, na, nb, hyper_ref,
                                                     precision = 10, alpha = 0.05,
@@ -82,13 +91,10 @@ computeConfidenceBoundsForDifferenceTwoProportionsFast <- function(ya, yb, preci
   return(as.list(ciSummary))
 }
 
-## =====================================================================
+######################################################################
 ## Experiment 4a: single-stream trace plot
-## =====================================================================
-theta_a <- 0.1
-theta_b <- theta_a + 0.002
-
-ya <- rbinom(N_max, 1, theta_a)
+######################################################################
+ya <- rbinom(N_max, 1, theta_a_ref)
 yb <- rbinom(N_max, 1, theta_b)
 
 checkpoints <- log_seq(10, N_max, n_points)
@@ -107,14 +113,16 @@ p_trace <- ggplot(df_trace, aes(m)) +
   geom_ribbon(aes(ymin = lower, ymax = upper), fill = "grey70", alpha = 0.5) +
   geom_line(aes(y = lower)) +
   geom_line(aes(y = upper)) +
-  geom_hline(yintercept = theta_b - theta_a, linetype = "dashed", colour = "red") +
+  geom_hline(yintercept = theta_b - theta_a_ref, linetype = "dashed", colour = "red") +
   scale_x_log10() +
   labs(x = "number of blocks (log scale)", y = expression(delta),
        title = "Confidence sequence for one simulated stream")
-ggsave("cs_trace.pdf", p_trace, width = 6, height = 4)
+ggsave("p_cs_trace.pdf", p_trace, width = 6, height = 4)
+
+## same plot but zoomed in ##
 
 p_trace_zoom <- p_trace + coord_cartesian(ylim = c(-0.02, 0.02))
-ggsave("cs_trace_zoom.pdf", p_trace_zoom, width = 6, height = 4)
+ggsave("p_cs_trace_zoom.pdf", p_trace_zoom, width = 6, height = 4)
 
 ## =====================================================================
 ## Experiment 4b: width comparison plot
@@ -195,7 +203,7 @@ classicalCIWidthAtCheckpoints <- function(ya, yb, na, nb, checkpoints, alpha = 0
   })
 }
 
-## ---- One replicate: simulate, compute both widths, checkpoint to disk ----
+## ---- Simulate one replicate, compute both widths, checkpoint to disk ----
 
 runOneReplicate <- function(m) {
   repFile <- file.path(outDir, sprintf("rep_%02d.rds", m))
@@ -236,7 +244,6 @@ saveRDS(dfAvg, file.path(outDir, sprintf("df_width_long_M%d.rds", M)))
 cat("\nDone. Averaged result saved to", file.path(outDir, sprintf("df_width_long_M%d.rds", M)), "\n")
 cat("Raw per-replicate data saved to", file.path(outDir, sprintf("width_ratio_raw_M%d.rds", M)), "\n")
 
-
 df_ratio <- dfAvg %>%
   pivot_wider(names_from = method, values_from = width) %>%
   rename(cs_width = `AV confidence sequence`, ci_width = `Classical CI (prop.test)`) %>%
@@ -254,7 +261,7 @@ ggplot(df_ratio, aes(x = n)) +
   theme_minimal() +
   theme(legend.position = "bottom")
 
-ggsave("width_ratio_validation.pdf", width = 6, height = 4)
+ggsave("p_width_ratio_validation.pdf", width = 6, height = 4)
 
 ggplot(dfAvg, aes(x = n, y = width, color = method)) +
   geom_line() + geom_point() +
@@ -264,4 +271,99 @@ ggplot(dfAvg, aes(x = n, y = width, color = method)) +
   theme(legend.position = "inside", legend.position.inside = c(0.75, 0.75),
         legend.background = element_blank())
 
-ggsave("figure_6_4_updated.pdf", width = 6, height = 4)
+ggsave("p_width_comparison.pdf", width = 6, height = 4)
+
+########################################################################
+## Fixed target width: comparison plots
+########################################################################
+
+## Classical CI: n_planned (fixed, from assumed baseline)
+
+nPlanned <- ceiling(4 * z_alpha^2 * (theta_a_ref * (1 - theta_a_ref) + theta_b * (1 - theta_b)) / wTarget^2)
+cat("n_planned (classical, committed) =", format(nPlanned, big.mark = "'"), "\n")
+
+## CS: n_CS(thetaA_star) from the validated asymptotic formula 
+
+rho <- function(n) sqrt(2 * log(1 / alpha) + log(n)) / z_alpha
+
+solveNForTargetWidth <- function(thetaA_star, thetaB_star, w, nMaxSearch = 1e9) {
+  Vstar <- thetaA_star * (1 - thetaA_star) + thetaB_star * (1 - thetaB_star)
+  f <- function(n) rho(n) * 2 * z_alpha * sqrt(Vstar / n) - w
+  uniroot(f, interval = c(100, nMaxSearch))$root
+}
+
+nCS <- sapply(thetaAStarGrid, function(ta) {
+  tb <- ta + delta0
+  solveNForTargetWidth(ta, tb, wTarget)
+})
+names(nCS) <- thetaAStarGrid
+cat("n_CS per theta_A*:\n")
+print(round(nCS))
+
+## Classical CI: simulate realized width at n_planned, per true theta_A* 
+
+simulateRealizedWidth <- function(thetaA_star, thetaB_star, n, M) {
+  succA <- rbinom(M, size = n, prob = thetaA_star)
+  succB <- rbinom(M, size = n, prob = thetaB_star)
+  thetaAHat <- succA / n
+  thetaBHat <- succB / n
+  se <- sqrt(thetaAHat * (1 - thetaAHat) / n + thetaBHat * (1 - thetaBHat) / n)
+  width <- 2 * z_alpha * se
+  diff <- thetaBHat - thetaAHat
+  lo <- diff - z_alpha * se
+  hi <- diff + z_alpha * se
+  covers_delta0 <- (lo <= delta0) & (hi >= delta0)
+  data.frame(width = width, covers_delta0 = covers_delta0)
+}
+
+dfClassical <- do.call(rbind, lapply(thetaAStarGrid, function(ta) {
+  tb <- ta + delta0
+  res <- simulateRealizedWidth(ta, tb, nPlanned, M)
+  data.frame(
+    thetaA_star = ta,
+    mean_width = mean(res$width),
+    se_width = sd(res$width) / sqrt(M),
+    coverage = mean(res$covers_delta0)
+  )
+}))
+cat("\nKlassischer CI -- realisierte Breite & Coverage von delta0, pro theta_A*:\n")
+print(dfClassical)
+
+## 4. Combine into plotting data frames and plot
+
+dfWidth <- rbind(
+  data.frame(thetaA_star = thetaAStarGrid, width = dfClassical$mean_width,
+             se = dfClassical$se_width, method = "Classical CI (realized)"),
+  data.frame(thetaA_star = thetaAStarGrid, width = wTarget, se = 0,
+             method = "Confidence sequence")
+)
+
+dfN <- rbind(
+  data.frame(thetaA_star = thetaAStarGrid, n = nPlanned, method = "Classical CI (committed)"),
+  data.frame(thetaA_star = thetaAStarGrid, n = as.numeric(nCS), method = "Confidence sequence")
+)
+
+p1 <- ggplot(dfWidth, aes(x = thetaA_star, y = width, color = method)) +
+  geom_hline(yintercept = wTarget, linetype = "dotted", color = "grey40") +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  labs(x = expression(paste("true baseline ", theta[a]^"*")),
+       y = "Width",
+       color = NULL) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+ggsave("p_cs_vs_fixedwidth_width.pdf", p1, width = 7.5, height = 5.5)
+
+p2 <- ggplot(dfN, aes(x = factor(thetaA_star), y = n, fill = method)) +
+  geom_col(position = "dodge", alpha = 0.85) +
+  scale_y_continuous(labels = comma) +
+  labs(x = expression(paste("true baseline ", theta[a]^"*")),
+       y = "Sample Size",
+       fill = NULL) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+ggsave("p_cs_vs_fixedwidth_samplesize.pdf", p2, width = 7.5, height = 5.5)
+
+
