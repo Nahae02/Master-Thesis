@@ -6,7 +6,7 @@ library(safestats)
 print(safeZTestStat(z = 2, phiS = 0.1, n1 = 100,
                     alternative = "twoSided", sigma = 1))
 
-## settings
+## --- settings ---
 sigma <- 1
 alpha <- 0.05
 N <- 300; M <- 1000
@@ -14,6 +14,7 @@ delta_bet <- 0.2
 phiS  <- delta_bet   # under the GROW default phiS == meanDiffMin, so we skip designSafeZ
 M_sweep <- 300
 
+## --- simulation ---
 run_sim <- function(mu, M) {
   rej <- matrix(FALSE, M, 4, dimnames = list(NULL, c("fixed","peek","safestats","hand"))) #Mx4 table: did each of the 4 methods reject?
   stp <- matrix(N,     M, 3, dimnames = list(NULL, c("peek","safestats","hand"))) # Mx3 table: stop time (init = N)
@@ -54,6 +55,7 @@ summarise_sim <- function(sim, M) {
   )
 }
 
+## ---- main H0 / H1 comparison ----
 simH0 <- run_sim(0,M)
 simH1 <- run_sim(delta_bet, M)
 cat("Under H0 (Type I error):\n")
@@ -61,7 +63,7 @@ print(summarise_sim(simH0, M), digits = 3)
 cat("\nUnder H1 (power + sample size):\n")
 print(summarise_sim(simH1, M), digits = 3)
 
-## run simulation at different effect sizes for power analysis
+## ---- power / sample-size sweep over true effect size ----
 mus <- seq(0, 0.2, by = 0.025) # effect sizes 0, 0,025,...
 sweep <- do.call(rbind, lapply(mus, function(effect) {
   s <- summarise_sim(run_sim(effect, M_sweep), M_sweep)
@@ -92,7 +94,7 @@ p_ass <- ggplot(sweep_ass, aes(mu, avg_sample_size, colour = method)) +
   scale_colour_manual(values = method_cols) +
   labs(x = expression(paste("true effect ", mu)), y = "average sample size")
 
-## cumulative type I error vs number of looks
+## ---- cumulative type I error vs number of looks ----
 grid <- seq(10, N, by = 10)
 cum_rate <- function(rej, stp) sapply(grid, function(t) mean(rej & stp <= t))
 df_cum <- rbind(
