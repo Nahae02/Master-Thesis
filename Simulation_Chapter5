@@ -165,7 +165,6 @@ ggsave("p_fisher_misspecified.pdf", p_misspec, width = 6, height = 4)
 ## Same budget comparison
 ###############################################################################
 
-N_budget          <- n_fisher_misspec
 M_budget          <- 100      # reduce for benchmarking, see below
 look_every_budget <- 5000
 
@@ -183,7 +182,7 @@ seq_power_at_budget <- function(restriction, delta) {
                                        alternativeRestriction="logOddsRatio", hyperParameterValues=hyper)
   }
   res <- do.call(rbind, parallel::mclapply(1:M_budget, function(i) {
-    ya <- rbinom(N_budget, 1, theta_a); yb <- rbinom(N_budget, 1, theta_b)
+    ya <- rbinom(n_fisher_misspec, 1, theta_a); yb <- rbinom(n_fisher_misspec, 1, theta_b)
     if (restriction == "none") {
       firstcross_2prop(ya, yb, priorA1, priorA2, priorB1, priorB2, look_every = look_every_budget)
     } else {
@@ -196,17 +195,10 @@ seq_power_at_budget <- function(restriction, delta) {
 grid_budget <- expand.grid(restriction = restrictions, delta = deltas_misspec_extended, stringsAsFactors = FALSE)
 grid_budget$power <- mapply(seq_power_at_budget, grid_budget$restriction, grid_budget$delta)
 
-fisher_misspec_power <- sapply(deltas_misspec_extended, function(d)
-  mean(replicate(1000, {
-    a <- rbinom(1, N_budget, theta_a); b <- rbinom(1, N_budget, theta_a + d)
-    fisher.test(matrix(c(a, N_budget-a, b, N_budget-b), 2))$p.value <= alpha
-  })))
-
-lbl2 <- c(none = "uninformed", difference = "difference", logOddsRatio = "odds")
 df_budget_compare <- rbind(
   data.frame(delta = deltas_misspec_extended, power = fisher_misspec_power,
              method = "Fisher (fixed n, misspecified)"),
-  transform(grid_budget, method = paste0("E-value (", lbl2[restriction], "), same budget"))[, c("delta","power","method")]
+  transform(grid_budget, method = paste0("E-value (", lbl[restriction], "), same budget"))[, c("delta","power","method")]
 )
 
 saveRDS(df_budget_compare, "df_budget_compare.rds")   # checkpoint before plotting
@@ -216,6 +208,6 @@ p_budget_compare <- ggplot(df_budget_compare, aes(delta, power, colour = method)
   geom_hline(yintercept = 0.8, linetype = "dashed") +
   geom_vline(xintercept = delta0, linetype = "dotted", colour = "grey40") +
   labs(x = expression(paste(delta, " (true effect)")), y = "achieved power",
-       title = paste0("Same fixed budget n=", N_budget, ": Fisher vs. e-value tests"),
+       title = paste0("Same fixed budget n=", n_fisher_misspec, ": Fisher vs. e-value tests"),
        colour = NULL)
 ggsave("p_same_budget_comparison.pdf", p_budget_compare, width = 8, height = 5)
