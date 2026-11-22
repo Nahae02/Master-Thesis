@@ -32,7 +32,7 @@ log_seq <- function(from, to, length.out) {
 design_cs <- designSafeTwoProportions(na = 1, nb = 1, alpha = alpha, nBlocksPlan = N_max, pilot = TRUE, hyperParameterValues = hyper_ref)
 
 ######################################################################
-### SAFESTATS FUNCTIONS REDONE USING BISECTION AND CUMULAITVE SUMS ###
+### SAFESTATS FUNCTIONS REDONE USING BISECTION AND CUMULATIVE SUMS ###
 ######################################################################
 
 calculateEValuesForLinearDeltaGridFast <- function(ya, yb, na, nb, hyper_ref,
@@ -124,9 +124,9 @@ ggsave("p_cs_trace.pdf", p_trace, width = 6, height = 4)
 p_trace_zoom <- p_trace + coord_cartesian(ylim = c(-0.02, 0.02))
 ggsave("p_cs_trace_zoom.pdf", p_trace_zoom, width = 6, height = 4)
 
-## =====================================================================
-## Experiment 4b: width comparison plot
-## =====================================================================
+######################################################################
+## width comparison plot
+######################################################################
 na <- 1; nb <- 1
 z_alpha <- qnorm(1 - alpha/2)
 tol <- 1e-6
@@ -157,41 +157,6 @@ logExcessAtN <- function(delta, ya, yb, na, nb, cumYa, cumYb,
   log(currentE) - log(1 / alpha)
 }
 
-findCSBoundary <- function(side, lo, hi, ya, yb, na, nb, cumYa, cumYb, priorA1, priorA2, priorB1, priorB2, n, alpha, tol = 1e-6) {
-  f <- function(delta) logExcessAtN(delta, ya, yb, na, nb, cumYa, cumYb, priorA1, priorA2, priorB1, priorB2, n, alpha)
-  fLo <- f(lo)
-  fHi <- f(hi)
-  if (is.na(fLo) || is.na(fHi) || sign(fLo) == sign(fHi)) {
-    return(if (side == "lower") lo else hi)
-  }
-  stats::uniroot(f, lower = lo, upper = hi, tol = tol)$root
-}
-
-computeCSWidthRootfind <- function(ya, yb, na, nb, hyper_ref,
-                                   checkpoints, alpha = 0.05, tol = 1e-6) {
-  checkpoints <- sort(checkpoints)
-  cumYa <- cumsum(ya); cumYb <- cumsum(yb)
-  priorA1 <- hyper_ref[["betaA1"]]; priorA2 <- hyper_ref[["betaA2"]]
-  priorB1 <- hyper_Ref[["betaB1"]]; priorB2 <- hyper_ref[["betaB2"]]
-  
-  lowerBound <- numeric(length(checkpoints)); upperBound <- numeric(length(checkpoints))
-  prevLo <- -0.99; prevHi <- 0.99
-  
-  for (k in seq_along(checkpoints)) {
-    n <- checkpoints[k]
-    thetaAHat <- cumYa[n] / (n * na); thetaBHat <- cumYb[n] / (n * nb)
-    deltaHat <- max(min(thetaBHat - thetaAHat, 0.98), -0.98)
-    
-    lo <- findCSBoundary("lower", prevLo, deltaHat, ya, yb, na, nb, cumYa, cumYb, priorA1, priorA2, priorB1, priorB2, n, alpha, tol)
-    hi <- findCSBoundary("upper", deltaHat, prevHi, ya, yb, na, nb, cumYa, cumYb, priorA1, priorA2, priorB1, priorB2, n, alpha, tol)
-    lowerBound[k] <- lo
-    upperBound[k] <- hi
-    prevLo <- lo
-    prevHi <- hi
-  }
-  data.frame(n = checkpoints, lower = lowerBound, upper = upperBound, width = upperBound - lowerBound)
-}
-
 classicalCIWidthAtCheckpoints <- function(ya, yb, na, nb, checkpoints, alpha = 0.05) {
   cumYa <- cumsum(ya); cumYb <- cumsum(yb)
   z <- qnorm(1 - alpha / 2)
@@ -203,7 +168,52 @@ classicalCIWidthAtCheckpoints <- function(ya, yb, na, nb, checkpoints, alpha = 0
   })
 }
 
-## ---- Simulate one replicate, compute both widths, checkpoint to disk ----
+findCSBoundary <- function(side, lo, hi, ya, yb, na, nb, cumYa, cumYb, priorA1, priorA2, priorB1, priorB2, n, alpha, tol = 1e-6) {
+  f <- function(delta) logExcessAtN(delta, ya, yb, na, nb, cumYa, cumYb, priorA1, priorA2, priorB1, priorB2, n, alpha)
+  fLo <- safestats:::tryOrFailWithNA(f(lo))
+  fHi <- safestats:::tryOrFailWithNA(f(hi))
+  if (is.na(fLo) || is.na(fHi) || sign(fLo) == sign(fHi)) {
+    # Bisection couldn't bracket a root: the search is stuck and would
+    # otherwise silently freeze at the unchanged boundary forever -- flag it
+    # so the caller can exclude this (and every later) checkpoint.
+    return(list(value = if (side == "lower") lo else hi, stuck = TRUE))
+  }
+  list(value = stats::uniroot(f, lower = lo, upper = hi, tol = tol)$root, stuck = FALSE)
+}
+
+computeCSWidthRootfind <- function(ya, yb, na, nb, hyper_ref,
+                                   checkpoints, alpha = 0.05, tol = 1e-6) {
+  checkpoints <- sort(checkpoints)
+  cumYa <- cumsum(ya); cumYb <- cumsum(yb)
+  priorA1 <- hyper_ref[["betaA1"]]; priorA2 <- hyper_ref[["betaA2"]]
+  priorB1 <- hyper_ref[["betaB1"]]; priorB2 <- hyper_ref[["betaB2"]]
+
+  lowerBound <- numeric(length(checkpoints)); upperBound <- numeric(length(checkpoints))
+  stuckFlag <- logical(length(checkpoints))
+  prevLo <- -0.99; prevHi <- 0.99
+  everStuck <- FALSE
+
+  for (k in seq_along(checkpoints)) {
+    n <- checkpoints[k]
+    thetaAHat <- cumYa[n] / (n * na); thetaBHat <- cumYb[n] / (n * nb)
+    deltaHat <- max(min(thetaBHat - thetaAHat, 0.98), -0.98)
+
+    loRes <- findCSBoundary("lower", prevLo, deltaHat, ya, yb, na, nb, cumYa, cumYb, priorA1, priorA2, priorB1, priorB2, n, alpha, tol)
+    hiRes <- findCSBoundary("upper", deltaHat, prevHi, ya, yb, na, nb, cumYa, cumYb, priorA1, priorA2, priorB1, priorB2, n, alpha, tol)
+    lo <- loRes$value; hi <- hiRes$value
+    # Once the search gets stuck at one checkpoint, prevLo/prevHi carry the
+    # frozen boundary forward, so every later checkpoint for this replicate
+    # is unreliable too -- mark it as such from here on.
+    everStuck <- everStuck || loRes$stuck || hiRes$stuck
+    lowerBound[k] <- lo
+    upperBound[k] <- hi
+    stuckFlag[k] <- everStuck
+    prevLo <- lo
+    prevHi <- hi
+  }
+  data.frame(n = checkpoints, lower = lowerBound, upper = upperBound,
+             width = upperBound - lowerBound, stuck = stuckFlag)
+}
 
 runOneReplicate <- function(m) {
   repFile <- file.path(outDir, sprintf("rep_%02d.rds", m))
@@ -211,33 +221,49 @@ runOneReplicate <- function(m) {
     cat("Replicate", m, "already done, loading from disk\n")
     return(readRDS(repFile))
   }
-  
-  set.seed(1000 + m)  # distinct, reproducible seed per replicate
-  nMax <- max(checkpoints)
-  ya <- rbinom(nMax, na, theta_a)
-  yb <- rbinom(nMax, nb, theta_b)
-  
-  t0 <- Sys.time()
-  csRes <- computeCSWidthRootfind(ya, yb, na, nb, hyper_ref, checkpoints, alpha, tol)
-  ciWidths <- classicalCIWidthAtCheckpoints(ya, yb, na, nb, checkpoints, alpha)
-  elapsed <- as.numeric(Sys.time() - t0, units = "secs")
-  cat("Replicate", m, "done in", round(elapsed, 1), "s\n")
-  
-  result <- rbind(
-    data.frame(rep = m, n = checkpoints, width = csRes$width, method = "AV confidence sequence"),
-    data.frame(rep = m, n = checkpoints, width = ciWidths, method = "Classical CI (prop.test)")
-  )
+
+  result <- tryCatch({
+    set.seed(1000 + m)  # distinct, reproducible seed per replicate
+    nMax <- max(checkpoints)
+    ya <- rbinom(nMax, na, theta_a_ref) 
+    yb <- rbinom(nMax, nb, theta_b)
+
+    t0 <- Sys.time()
+    csRes <- computeCSWidthRootfind(ya, yb, na, nb, hyper_ref, checkpoints, alpha, tol)
+    ciWidths <- classicalCIWidthAtCheckpoints(ya, yb, na, nb, checkpoints, alpha)
+    elapsed <- as.numeric(Sys.time() - t0, units = "secs")
+    cat("Replicate", m, "done in", round(elapsed, 1), "s\n")
+
+    rbind(
+      data.frame(rep = m, n = checkpoints, width = csRes$width, method = "AV confidence sequence", stuck = csRes$stuck),
+      data.frame(rep = m, n = checkpoints, width = ciWidths, method = "Classical CI (prop.test)", stuck = FALSE)
+    )
+  }, error = function(e) {
+    cat("Replicate", m, "FAILED:", conditionMessage(e), "\n")
+    rbind(
+      data.frame(rep = m, n = checkpoints, width = NA_real_, method = "AV confidence sequence", stuck = NA),
+      data.frame(rep = m, n = checkpoints, width = NA_real_, method = "Classical CI (prop.test)", stuck = NA)
+    )
+  })
+
   saveRDS(result, repFile)
   result
 }
 
 ## ---- Run all M replicates in parallel, combine, save ----
 
-allResults <- parallel::mclapply(seq_len(M), runOneReplicate, mc.cores = nCores)
+allResults <- parallel::mclapply(seq_len(M), runOneReplicate, mc.cores = 100)
 dfRaw <- do.call(rbind, allResults)
 saveRDS(dfRaw, file.path(outDir, sprintf("width_ratio_raw_M%d.rds", M)))
 
-dfAvg <- aggregate(width ~ n + method, data = dfRaw, FUN = mean)
+stuckRows <- !is.na(dfRaw$stuck) & dfRaw$stuck
+nStuck <- sum(stuckRows)
+if (nStuck > 0) cat(nStuck, "rows had a stuck CS boundary search (frozen from an earlier checkpoint) and were excluded from the average\n")
+dfRaw$width[stuckRows] <- NA_real_
+
+nBad <- sum(is.na(dfRaw$width))
+if (nBad > 0) cat(nBad, "replicate-checkpoint rows failed or got excluded and were left out of the average\n")
+dfAvg <- aggregate(width ~ n + method, data = dfRaw, FUN = mean, na.action = na.omit)
 dfAvg <- dfAvg[order(dfAvg$method, dfAvg$n), ]
 saveRDS(dfAvg, file.path(outDir, sprintf("df_width_long_M%d.rds", M)))
 
@@ -250,14 +276,14 @@ df_ratio <- dfAvg %>%
   mutate(ratio = cs_width / ci_width, theoretical = sqrt(2 * log(1 / alpha) + log(n)) / z_alpha)
 
 ggplot(df_ratio, aes(x = n)) +
-  geom_point(aes(y = ratio, color = "Empirical (M=20 avg)")) +
-  geom_line(aes(y = ratio, color = "Empirical (M=20 avg)")) +
+  geom_point(aes(y = ratio, color = "Empirical (M=500 avg)")) +
+  geom_line(aes(y = ratio, color = "Empirical (M=500 avg)")) +
   geom_line(aes(y = theoretical, color = "Theoretical"), linetype = "dashed") +
   scale_x_log10(labels = scales::comma) +
   labs(x = "Sample size n (log scale)",
        y = "Width ratio (CS / classical CI)",
        color = NULL,
-       title = "Empirical vs. theoretical asymptotic width ratio (M=20 replicates)") +
+       title = "Empirical vs. theoretical asymptotic width ratio (M=500 replicates)") +
   theme_minimal() +
   theme(legend.position = "bottom")
 
